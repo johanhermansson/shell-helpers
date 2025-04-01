@@ -195,4 +195,4 @@ Contributions are welcome! If you have improvements or new shell helper scripts 
 
 ## License
 
-[MIT License](LICENSE)
+[GPL-3.0 License](LICENSE)
