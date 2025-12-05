@@ -20,6 +20,29 @@ check-urls.sh -f rules.csv
 check-urls.sh -r "301,example.com,/old-page,https://example.com/new-page"
 ```
 
+### check-imports.sh
+
+A script that finds files using a function without importing it from a specific package.
+
+**Features:**
+- Searches for function usage across multiple file types
+- Validates that functions are properly imported from specified packages
+- Supports customizable file extensions
+- Provides detailed reporting with file paths and counts
+- Useful for catching missing imports in large codebases
+
+**Usage:**
+```bash
+check-imports.sh -f=functionName -p=@package/name src
+check-imports.sh --function functionName --package @package/name src vite/src
+check-imports.sh -f=__ -p=@wordpress/i18n -e=js,jsx src
+```
+
+**Parameters:**
+- `-f, --function`: Function name to search for (required)
+- `-p, --package`: Package it should be imported from (required)
+- `-e, --extensions`: Comma-separated file extensions (default: js,ts,tsx)
+
 ### semver-tag.sh
 
 Creates and pushes a new semantic version tag for Git repositories.
@@ -133,6 +156,9 @@ Add aliases to your `~/.bashrc`, `~/.zshrc`, or equivalent shell configuration f
 # URL redirect checker
 alias check-urls="/path/to/shell-helpers/check-urls.sh"
 
+# Import validation checker
+alias check-imports="/path/to/shell-helpers/check-imports.sh"
+
 # Git semantic versioning
 alias semver-tag="/path/to/shell-helpers/semver-tag.sh"
 
@@ -156,6 +182,11 @@ For more flexibility, you can create shell functions in your `~/.bashrc`, `~/.zs
 # URL redirect checker
 check-urls() {
     /path/to/shell-helpers/check-urls.sh "$@"
+}
+
+# Import validation checker
+check-imports() {
+    /path/to/shell-helpers/check-imports.sh "$@"
 }
 
 # Git semantic versioning
@@ -192,6 +223,19 @@ check-urls -r "301,example.com,/old-page,https://example.com/new-page"
 
 # Show verbose output
 check-urls -f redirects.csv -v
+```
+
+### Validating Function Imports
+
+```bash
+# Check if all files using _x import it from @wordpress/i18n
+check-imports -f=_x -p=@wordpress/i18n src
+
+# Check multiple directories
+check-imports --function __ --package @wordpress/i18n src vite/src
+
+# Check specific file extensions
+check-imports -f=__ -p=@wordpress/i18n -e=js,jsx src
 ```
 
 ### Managing Git Tags
@@ -250,6 +294,7 @@ Each script includes a help option that provides detailed usage information:
 
 ```bash
 check-urls.sh --help
+check-imports.sh --help
 semver-tag.sh --help
 test-tag.sh --help
 compare-dns.sh --help
