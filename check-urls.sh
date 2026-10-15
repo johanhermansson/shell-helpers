@@ -35,7 +35,8 @@ usage() {
     echo ""
     echo "The path is a regex; inline flags ((?i)), escapes (\\.), quantifiers,"
     echo "character classes, alternation and capture groups are all understood and"
-    echo "turned into a concrete URL to request."
+    echo "turned into a concrete URL to request. With perl installed, that URL is"
+    echo "checked against the pattern and \$1..\$9 are taken from the match."
     echo ""
     echo "The target is an absolute URL, a protocol relative URL (//host/path) or a"
     echo "path on the same domain (/new-page/), and may use \$1..\$9 to reference"
@@ -123,117 +124,185 @@ unquote_field() {
 }
 
 # Function to read a quantifier at index $2 of pattern $1.
-# Echoes "<index after the quantifier> <repeat count>"
+# Echoes "<index after the quantifier> <count>". The count is the minimum of
+# {n}, {n,} and {n,m}, "many" for + and *, and 1 for ? or no quantifier at
+# all - an optional element is simply included once.
 read_quantifier() {
     local pattern="$1"
     local idx="$2"
-    local rep=1
-    local count="" j
+    local count=1
+    local spec="" j
     case "${pattern:idx:1}" in
-        '*'|'+'|'?')
+        '*'|'+')
+            count="many"
+            (( idx++ ))
+            ;;
+        '?')
             (( idx++ ))
             ;;
         '{')
             j=$(( idx + 1 ))
             while [[ -n "${pattern:j:1}" && "${pattern:j:1}" != '}' ]]; do
-                count+="${pattern:j:1}"
+                spec+="${pattern:j:1}"
                 (( j++ ))
             done
-            idx=$(( j + 1 ))
-            count="${count%%,*}"
-            [[ "$count" =~ ^[0-9]+$ ]] && rep=$count
+            spec="${spec%%,*}"
+            # Anything but {n...} is a literal brace, not a quantifier
+            if [[ "$spec" =~ ^[0-9]+$ ]]; then
+                count=$(( 10#$spec ))
+                idx=$(( j + 1 ))
+            fi
             ;;
     esac
-    # Collapse any remaining quantifier characters
+    # Lazy and possessive modifiers (*?, ++) make no difference to a sample
     while [[ "${pattern:idx:1}" == [*+?] ]]; do (( idx++ )); done
-    echo "$idx $rep"
+    echo "$idx $count"
 }
 
-# Function to repeat a sampled value to satisfy a {n} quantifier
+# Function to build a sample of the length a quantifier asks for from a pool
+# of characters. The pool is cycled, so \d{4} becomes 1234 and [a-z]{8}
+# becomes samplesa. "many" gives the word pools in full and three characters
+# of anything else.
 sample_repeat() {
-    local sample="$1"
-    local rep="$2"
+    local pool="$1"
+    local count="$2"
     local out="" k
-    if (( rep <= 1 )); then
-        printf '%s' "$sample"
+
+    # A space is a single URL encoded unit and is never cut up
+    if [[ "$pool" == "%20" ]]; then
+        [[ "$count" == "many" ]] && count=1
+        for (( k = 0; k < count; k++ )); do out+="%20"; done
+        printf '%s' "$out"
         return
     fi
-    if [[ "$sample" == "123" ]]; then
-        for (( k = 1; k <= rep; k++ )); do out+=$(( k % 10 )); done
-    else
-        for (( k = 1; k <= rep; k++ )); do out+="${sample:0:1}"; done
+
+    if [[ "$count" == "many" ]]; then
+        case "$pool" in
+            sample|SAMPLE) count=6 ;;
+            *) count=3 ;;
+        esac
     fi
+    for (( k = 0; k < count; k++ )); do
+        out+="${pool:k % ${#pool}:1}"
+    done
     printf '%s' "$out"
 }
 
-# Function to pick a concrete value for a regex sub-pattern (group or class)
-sample_for() {
-    local inner="$1"
-
-    # Alternation: the first branch is enough to exercise the rule
-    if [[ "$inner" == *"|"* ]]; then
-        printf '%s' "${inner%%|*}" | sed 's/\\\(.\)/\1/g; s/[()]//g'
-        return
-    fi
-
-    case "$inner" in
-        '\d'*|'[0-9]'*|'[[:digit:]]'*)
-            printf '123'
-            ;;
-        '.'*|'\w'*|'[^'*|'[a-'*|'[A-'*|'[[:'*)
-            printf 'sample'
-            ;;
-        *)
-            # A literal group such as (foo): use it as-is, without regex noise
-            printf '%s' "$inner" | sed 's/\\\(.\)/\1/g; s/[*+?()]//g'
-            ;;
-    esac
+# Function to find the index of the ] that closes the class starting at $2
+class_end() {
+    local pattern="$1"
+    local j=$(( $2 + 1 ))
+    local n=${#pattern}
+    [[ "${pattern:j:1}" == '^' ]] && (( j++ ))
+    [[ "${pattern:j:1}" == ']' ]] && (( j++ ))
+    while (( j < n )) && [[ "${pattern:j:1}" != ']' ]]; do
+        if [[ "${pattern:j:2}" == '[:' ]]; then
+            # A POSIX class such as [:digit:] has a ] of its own
+            (( j += 2 ))
+            while (( j < n )) && [[ "${pattern:j:2}" != ':]' ]]; do (( j++ )); done
+            (( j += 2 ))
+            continue
+        fi
+        [[ "${pattern:j:1}" == '\' ]] && (( j++ ))
+        (( j++ ))
+    done
+    echo "$j"
 }
 
-# Function to turn a regex path pattern into a concrete path to request.
-# Sets TEST_PATH and CAPTURES (CAPTURES[0] is $1, CAPTURES[1] is $2, ...)
-build_test_path() {
-    local pattern="$1"
-    local out=""
-    local i=0 n ch after rep depth j inner cls sample capturing next_ch
-    CAPTURES=()
-    CAPTURE_WILDCARD=false
+# Function to pick a sample pool for a character class such as [a-z0-9-].
+# Candidates are tried against the class with bash's own regex engine, after
+# translating the Perl style escapes it does not understand.
+class_pool() {
+    local cls="$1"
+    local body="${cls:1:${#cls}-2}"
+    local negated="" translated="" close="" dash="" caret=""
+    local k c re candidate
 
-    # Drop inline flag groups anywhere in the pattern, e.g. (?i) (?im) (?-i)
-    while [[ "$pattern" =~ \(\?[a-zA-Z-]+\) ]]; do
-        pattern="${pattern/"${BASH_REMATCH[0]}"/}"
+    if [[ "$body" == ^* ]]; then
+        negated="^"
+        body="${body:1}"
+    fi
+
+    # Translate escapes into what a POSIX bracket expression expects
+    for (( k = 0; k < ${#body}; k++ )); do
+        c="${body:k:1}"
+        if [[ "$c" != '\' ]]; then
+            translated+="$c"
+            continue
+        fi
+        (( k++ ))
+        c="${body:k:1}"
+        case "$c" in
+            d) translated+="0-9" ;;
+            w) translated+="A-Za-z0-9_" ;;
+            s) translated+="[:space:]" ;;
+            ']') close="]" ;;
+            '-') dash="-" ;;
+            '^') caret="^" ;;
+            *) translated+="$c" ;;
+        esac
     done
+    re="[${negated}${close}${translated}${caret}${dash}]"
 
-    # Drop the anchors
-    pattern="${pattern#^}"
-    pattern="${pattern%\$}"
+    for candidate in sample 1234567890 SAMPLE 123; do
+        if [[ "$candidate" =~ ^${re}+$ ]]; then
+            echo "$candidate"
+            return
+        fi
+    done
+    for (( k = 0; k < 66; k++ )); do
+        candidate="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.~"
+        candidate="${candidate:k:1}"
+        if [[ "$candidate" =~ ^${re}$ ]]; then
+            echo "$candidate"
+            return
+        fi
+    done
+    echo "x"
+}
 
-    n=${#pattern}
+# Function to turn a regex, or a part of one, into a concrete string that it
+# matches. Sets RENDERED. Capturing groups are stored in CAPTURES in the order
+# of their opening parenthesis, so nested groups are numbered the way the
+# regex engine numbers them. SAW_WILDCARD is set when part of the pattern
+# stands for arbitrary text rather than something fixed.
+# With $2 set to true the pattern is a whole path, which starts with a slash.
+render_regex() {
+    local pattern="$1"
+    local top="${2:-false}"
+    local out=""
+    local i=0 n=${#pattern}
+    local ch c next_ch after count depth j k inner pool sample last
+    local capturing slot outer_wild group_wild
+
     while (( i < n )); do
         ch="${pattern:i:1}"
+        sample=""
         case "$ch" in
             '\')
-                # Escaped character: a shorthand class gets a sample,
-                # anything else is taken literally
                 next_ch="${pattern:i+1:1}"
                 case "$next_ch" in
-                    d|D) sample="123" ;;
-                    w|W) sample="sample" ;;
-                    s) sample="%20" ;;
-                    *) sample="" ;;
+                    b|B|A|z|Z|G)
+                        # Anchors and word boundaries match no text
+                        (( i += 2 ))
+                        continue
+                        ;;
+                    d) pool="1234567890" ;;
+                    D|w|S) pool="sample" ;;
+                    W) pool="-" ;;
+                    s) pool="%20" ;;
+                    *) pool="" ;;
                 esac
-                if [[ -n "$sample" ]]; then
-                    read -r after rep <<< "$(read_quantifier "$pattern" $(( i + 2 )))"
-                    sample=$(sample_repeat "$sample" "$rep")
-                    if [[ -z "$out" && "$sample" != /* ]]; then
-                        sample="/$sample"
-                    fi
-                    out+="$sample"
-                    i=$after
-                else
+                if [[ -z "$pool" ]]; then
+                    # Any other escaped character is taken literally
                     out+="$next_ch"
                     (( i += 2 ))
+                    continue
                 fi
+                [[ "$pool" == "sample" ]] && SAW_WILDCARD=true
+                read -r after count <<< "$(read_quantifier "$pattern" $(( i + 2 )))"
+                sample=$(sample_repeat "$pool" "$count")
+                i=$after
                 ;;
             '(')
                 # Find the matching closing parenthesis
@@ -247,6 +316,13 @@ build_test_path() {
                         (( j += 2 ))
                         continue
                     fi
+                    if [[ "$c" == '[' ]]; then
+                        # A class may hold parentheses of its own
+                        k=$(class_end "$pattern" "$j")
+                        inner+="${pattern:j:k-j+1}"
+                        j=$(( k + 1 ))
+                        continue
+                    fi
                     if [[ "$c" == '(' ]]; then
                         (( depth++ ))
                     elif [[ "$c" == ')' ]]; then
@@ -257,85 +333,185 @@ build_test_path() {
                     (( j++ ))
                 done
 
-                # Skip any quantifier attached to the group
-                read -r after rep <<< "$(read_quantifier "$pattern" $(( j + 1 )))"
+                read -r after count <<< "$(read_quantifier "$pattern" $(( j + 1 )))"
 
                 capturing=true
-                if [[ "$inner" == '?:'* ]]; then
-                    inner="${inner#\?:}"
-                    capturing=false
+                case "$inner" in
+                    '?:'*)
+                        inner="${inner:2}"
+                        capturing=false
+                        ;;
+                    '?='*|'?!'*|'?<='*|'?<!'*)
+                        # Lookarounds match no text
+                        inner=""
+                        capturing=false
+                        ;;
+                    '?<'*|'?P<'*)
+                        # Named group
+                        inner="${inner#*>}"
+                        ;;
+                    '?'[a-zA-Z-]*':'*)
+                        # Scoped flags such as (?i:...)
+                        inner="${inner#*:}"
+                        capturing=false
+                        ;;
+                esac
+
+                if $capturing; then
+                    slot=${#CAPTURES[@]}
+                    CAPTURES+=("")
                 fi
 
-                sample=$(sample_for "$inner")
-                # A group that stands for arbitrary path, rather than a choice
+                outer_wild=$SAW_WILDCARD
+                SAW_WILDCARD=false
+                render_regex "$inner"
+                group_wild=$SAW_WILDCARD
+                $outer_wild && SAW_WILDCARD=true
+
+                # A group that stands for arbitrary text, rather than a choice
                 # between fixed alternatives, is worth knowing about later
-                if $capturing && [[ "$sample" == "sample" ]]; then
-                    CAPTURE_WILDCARD=true
+                $capturing && $group_wild && CAPTURE_WILDCARD=true
+
+                # A group at the very start of a path stands for the whole
+                # path, leading slash included
+                if $top && [[ -z "$out" && -n "$RENDERED" && "$RENDERED" != /* ]]; then
+                    RENDERED="/$RENDERED"
                 fi
-                # A wildcard group at the very start stands for the whole path,
-                # leading slash included
-                if [[ -z "$out" && -n "$sample" && "$sample" != /* ]]; then
-                    sample="/$sample"
-                fi
-                $capturing && CAPTURES+=("$sample")
-                out+="$sample"
+
+                # One repetition of the group is enough, and it is also what
+                # the engine captures; {n} repeats it
+                [[ "$count" == "many" ]] && count=1
+                for (( k = 0; k < count; k++ )); do sample+="$RENDERED"; done
+                (( count > 0 )) && $capturing && CAPTURES[slot]="$RENDERED"
                 i=$after
                 ;;
             '[')
-                # Character class
-                j=$(( i + 1 ))
-                [[ "${pattern:j:1}" == '^' ]] && (( j++ ))
-                [[ "${pattern:j:1}" == ']' ]] && (( j++ ))
-                while (( j < n )) && [[ "${pattern:j:1}" != ']' ]]; do
-                    [[ "${pattern:j:1}" == '\' ]] && (( j++ ))
-                    (( j++ ))
-                done
-                cls="${pattern:i:j-i+1}"
-                read -r after rep <<< "$(read_quantifier "$pattern" $(( j + 1 )))"
-                sample=$(sample_repeat "$(sample_for "$cls")" "$rep")
-                if [[ -z "$out" && -n "$sample" && "$sample" != /* ]]; then
-                    sample="/$sample"
-                fi
-                out+="$sample"
+                j=$(class_end "$pattern" "$i")
+                pool=$(class_pool "${pattern:i:j-i+1}")
+                [[ "$pool" == sample || "$pool" == SAMPLE ]] && SAW_WILDCARD=true
+                read -r after count <<< "$(read_quantifier "$pattern" $(( j + 1 )))"
+                sample=$(sample_repeat "$pool" "$count")
                 i=$after
                 ;;
             '.')
-                case "${pattern:i+1:1}" in
-                    '*'|'+') sample="sample" ;;
-                    '?') sample="" ;;
-                    *) sample="x" ;;
-                esac
-                read -r after rep <<< "$(read_quantifier "$pattern" $(( i + 1 )))"
-                [[ "$sample" == "x" ]] && sample=$(sample_repeat "$sample" "$rep")
-                if [[ -z "$out" && -n "$sample" && "$sample" != /* ]]; then
-                    sample="/$sample"
+                read -r after count <<< "$(read_quantifier "$pattern" $(( i + 1 )))"
+                if [[ "$count" == "1" ]]; then
+                    # A single dot is most often a literal dot that was not
+                    # escaped, and a dot is a character it matches
+                    sample="."
+                else
+                    [[ "$count" == "many" ]] && SAW_WILDCARD=true
+                    sample=$(sample_repeat "sample" "$count")
                 fi
-                out+="$sample"
                 i=$after
                 ;;
             '{')
-                # Quantifier on the previous literal: keep the single literal
-                j=$i
-                while (( j < n )) && [[ "${pattern:j:1}" != '}' ]]; do (( j++ )); done
-                i=$(( j + 1 ))
+                read -r after count <<< "$(read_quantifier "$pattern" "$i")"
+                if (( after == i )); then
+                    # Not a quantifier, just a brace
+                    out+="{"
+                    (( i++ ))
+                    continue
+                fi
+                # Quantifier on the literal we already emitted
+                last="${out: -1}"
+                out="${out%?}"
+                [[ "$count" == "many" ]] && count=1
+                for (( k = 0; k < count; k++ )); do out+="$last"; done
+                i=$after
+                continue
                 ;;
             '*'|'+'|'?')
-                # Quantifier on the literal we already emitted
+                # Quantifier on the literal we already emitted: keep it once
                 (( i++ ))
+                continue
+                ;;
+            '^'|'$'|')')
+                (( i++ ))
+                continue
                 ;;
             '|')
-                # Top level alternation: the first branch is enough
+                # Alternation: the first branch is enough to exercise the rule
                 break
                 ;;
             *)
                 out+="$ch"
                 (( i++ ))
+                continue
                 ;;
         esac
+
+        if $top && [[ -z "$out" && -n "$sample" && "$sample" != /* ]]; then
+            sample="/$sample"
+        fi
+        out+="$sample"
     done
 
-    [[ "$out" != /* ]] && out="/$out"
-    TEST_PATH="$out"
+    RENDERED="$out"
+}
+
+# Function to check the derived path against the original regex with perl,
+# whose regex syntax is the one redirect engines use. When it matches, the
+# captures are taken from perl, so $1..$9 are exactly what the engine sees.
+# Sets PATH_CHECK to matched, mismatch or unchecked (no perl, or a pattern
+# perl cannot compile).
+verify_test_path() {
+    local pattern="$1"
+    local candidate result status count line k
+
+    PATH_CHECK="unchecked"
+    command -v perl > /dev/null 2>&1 || return
+
+    # Engines differ on whether the path they match starts with a slash
+    for candidate in "$TEST_PATH" "${TEST_PATH#/}"; do
+        result=$(perl -e '
+            my ($re, $path) = @ARGV;
+            my $compiled = eval { qr/$re/ };
+            exit 2 unless $compiled;
+            exit 1 unless $path =~ $compiled;
+            print $#+, "\n";
+            for my $i (1 .. $#+) {
+                print defined $-[$i] ? substr($path, $-[$i], $+[$i] - $-[$i]) : "", "\n";
+            }
+        ' "$pattern" "$candidate" 2> /dev/null)
+        status=$?
+        if (( status == 0 )); then
+            PATH_CHECK="matched"
+            CAPTURES=()
+            {
+                read -r count
+                for (( k = 0; k < count; k++ )); do
+                    IFS= read -r line
+                    CAPTURES+=("$line")
+                done
+            } <<< "$result"
+            return
+        fi
+        (( status == 2 )) && return
+    done
+    PATH_CHECK="mismatch"
+}
+
+# Function to turn a regex path pattern into a concrete path to request.
+# Sets TEST_PATH, CAPTURES (CAPTURES[0] is $1, CAPTURES[1] is $2, ...),
+# CAPTURE_WILDCARD and PATH_CHECK
+build_test_path() {
+    local pattern="$1"
+    local flagless="$pattern"
+    CAPTURES=()
+    CAPTURE_WILDCARD=false
+    SAW_WILDCARD=false
+
+    # Inline flag groups such as (?i) (?im) (?-i) match no text
+    while [[ "$flagless" =~ \(\?[a-zA-Z-]+\) ]]; do
+        flagless="${flagless/"${BASH_REMATCH[0]}"/}"
+    done
+
+    render_regex "$flagless" true
+    TEST_PATH="$RENDERED"
+    [[ "$TEST_PATH" != /* ]] && TEST_PATH="/$TEST_PATH"
+
+    verify_test_path "$pattern"
 }
 
 # Function to expand the target of a rule into an absolute URL.
@@ -488,7 +664,11 @@ follow_redirects() {
 
 # Output summary header
 echo "=== Redirect Rules Checker ==="
-echo "Checking redirect rules..."
+if $DRY_RUN; then
+    echo "Dry run: deriving test URLs and expected targets, no requests are made"
+else
+    echo "Checking redirect rules..."
+fi
 echo ""
 
 # Initialize counters
@@ -549,15 +729,26 @@ while IFS= read -r line; do
     echo "Testing URL: $test_url"
     echo "Expected: $code redirect to $expected_url"
 
+    rule_warned=false
+
+    # A test URL the pattern does not match says nothing about the rule
+    if [[ "$PATH_CHECK" == "mismatch" ]]; then
+        echo "⚠️  Warning: the path pattern does not match $TEST_PATH - the pattern uses"
+        echo "   syntax that could not be turned into a URL, so this check is not reliable"
+        rule_warned=true
+    fi
+
     # An unresolved $1 means the target references a group the path does not have
     if [[ "$expected_url" =~ (\$|\\)[1-9] ]]; then
         echo "⚠️  Warning: the target references a capture group the path does not have"
+        rule_warned=true
     fi
 
     # The reverse: the path captures something the target never uses. Usually a
     # $1 that the shell expanded away before the script saw the rule.
     if $CAPTURE_WILDCARD && [[ "$redirect_to" != *'$'* && "$redirect_to" != *'\'[1-9]* ]]; then
         echo "⚠️  Warning: the path captures a group but the target does not use it"
+        rule_warned=true
         if [[ "$RULES_SOURCE" == "argument" ]]; then
             echo "   A \$1 inside double quotes is expanded by the shell - pass the rule"
             echo "   in single quotes: -r '$code,$domain,$path,$redirect_to\$1'"
@@ -571,6 +762,7 @@ while IFS= read -r line; do
     fi
 
     if $DRY_RUN; then
+        $rule_warned && ((WARNED++))
         echo "--------------------------------------------------------------------------------"
         echo ""
         continue
@@ -689,6 +881,12 @@ done <<< "$RULES"
 # Output summary
 echo ""
 echo "=== Summary ==="
+if $DRY_RUN; then
+    echo "Rules parsed: $TOTAL"
+    echo "Rules with warnings: $WARNED"
+    echo "Dry run: no requests were made, so no rule has passed or failed"
+    exit 0
+fi
 echo "Total rules checked: $TOTAL"
 echo "Passed: $PASSED"
 if (( WARNED > 0 )); then

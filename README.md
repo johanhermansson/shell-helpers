@@ -11,9 +11,15 @@ A script that checks if redirect rules defined in CSV format are correctly imple
 **Features:**
 - Validates URL redirects against expected rules
 - Supports reading rules from a file or directly from the command line
-- Understands regex paths: inline flags (`(?i)`), escapes (`\.`), quantifiers,
-  character classes, alternation and capture groups, and turns them into a
-  concrete URL to request
+- Understands regex paths: inline and scoped flags (`(?i)`, `(?i:...)`),
+  escapes (`\.`, `\d`, `\w`), quantifiers (`+`, `*`, `?`, `{n}`, `{n,m}`, also
+  inside groups), character classes, alternation, and nested, named and
+  non-capturing groups. These are turned into a concrete URL to request, e.g.
+  `^/news/(\d{4})-(\d{2})/(.+)$` becomes `/news/1234-12/sample`
+- If `perl` is available, the derived URL is checked against the pattern itself,
+  and `$1`..`$9` are taken from that match. A pattern the script cannot turn
+  into a matching URL, e.g. one with a lookahead, gets a ⚠️ warning instead of a
+  misleading result
 - Targets can be absolute URLs, protocol relative URLs (`//host/path`), paths on
   the same domain (`/new-page/`) or reference capture groups with `$1`..`$9`
 - Follows redirect chains, resolves relative `Location` headers and stops on loops
@@ -44,6 +50,9 @@ check-urls.sh -f rules.csv
 check-urls.sh -r "301,example.com,/old-page,https://example.com/new-page"
 check-urls.sh -f rules.csv -n   # only show the derived test URL and expected target
 ```
+
+A dry run (`-n`) makes no requests. Its summary counts the rules parsed and the
+rules with warnings, not passes or failures.
 
 ### check-imports.sh
 
