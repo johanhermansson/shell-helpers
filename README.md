@@ -11,13 +11,38 @@ A script that checks if redirect rules defined in CSV format are correctly imple
 **Features:**
 - Validates URL redirects against expected rules
 - Supports reading rules from a file or directly from the command line
-- Follows redirect chains and verifies final destinations
+- Understands regex paths: inline flags (`(?i)`), escapes (`\.`), quantifiers,
+  character classes, alternation and capture groups, and turns them into a
+  concrete URL to request
+- Targets can be absolute URLs, protocol relative URLs (`//host/path`), paths on
+  the same domain (`/new-page/`) or reference capture groups with `$1`..`$9`
+- Follows redirect chains, resolves relative `Location` headers and stops on loops
+- Judges the rule, not the whole chain: a rule passes when the redirect it
+  describes actually happened and the chain ends on a 200. Extra hops, or a
+  landing URL further down the chain, are ⚠️ warnings on a passing rule
+- Explains a failure: a redirect to the right URL with the wrong status code, or
+  to the right host with a different path, is reported as such
 - Provides detailed reporting with success/failure status
+
+**CSV format:** `code,domain,path,redirect_to`
+
+```csv
+301,www.example.com,^/old-page/?$,https://www.example.com/new-page/
+301,www.example.com,(?i)^/old-page\.aspx$,/new-page/
+301,www.example.com,^/products/(.*)$,/shop/$1
+301,example.com,(.*),https://www.example.com$1
+```
+
+Lines starting with `#`, blank lines and a `code,...` header row are skipped.
+
+Rules given with `-r` must be **single quoted** — in double quotes the shell
+expands `$1` away before the script sees it.
 
 **Usage:**
 ```bash
 check-urls.sh -f rules.csv
 check-urls.sh -r "301,example.com,/old-page,https://example.com/new-page"
+check-urls.sh -f rules.csv -n   # only show the derived test URL and expected target
 ```
 
 ### check-imports.sh
@@ -221,8 +246,17 @@ check-urls -f redirects.csv
 # Check a specific redirect rule
 check-urls -r "301,example.com,/old-page,https://example.com/new-page"
 
-# Show verbose output
+# Show verbose output, including the value of each capture group
 check-urls -f redirects.csv -v
+
+# Check a rule that redirects to a path on the same domain
+check-urls -r "301,www.example.com,(?i)^/old-page\.aspx$,/new-page/"
+
+# Check a rule with a capture group in the target (single quotes!)
+check-urls -r '301,example.com,(.*),https://www.example.com$1'
+
+# Dry run: derive the test URLs and expected targets without making requests
+check-urls -f redirects.csv -n
 ```
 
 ### Validating Function Imports
